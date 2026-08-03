@@ -23,6 +23,16 @@ class TranscriptionResult(BaseModel):
     processing_seconds: float
     words: List[TranscribedWord] = Field(default_factory=list)
     segments: List[TranscribedSegment] = Field(default_factory=list)
+    # Cache identity / chunking metadata (optional, filled by chunked pipeline).
+    audio_sha256: Optional[str] = None
+    chunking_enabled: Optional[bool] = None
+    chunk_duration: Optional[float] = None
+    overlap: Optional[float] = None
+    created_at: Optional[str] = None
+    chunk_count: Optional[int] = None
+    chunk_boundaries: List[List[float]] = Field(default_factory=list)
+    words_per_chunk: List[int] = Field(default_factory=list)
+    duplicates_removed: Optional[int] = None
 
 class TranscriptionProvider(ABC):
     @abstractmethod

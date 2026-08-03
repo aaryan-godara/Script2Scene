@@ -59,7 +59,7 @@ class PipelineRunnerTest(unittest.TestCase):
             intermediate_dir=job.intermediate_dir,
             output_dir=job.output_dir,
             logs_dir=job.logs_dir,
-            render=True,
+            render=kwargs.pop("render", True),
             **kwargs,
         )
 
@@ -118,18 +118,124 @@ class PipelineRunnerTest(unittest.TestCase):
             self._run(runner, pj, job.images_dir, job)
         self.assertIn("could not be aligned confidently", str(ctx.exception))
 
-    def test_review_stops_unless_allowed(self):
+    def test_alignment_failure_writes_pipeline_log(self):
         job = self.manager.create_job()
-        pj = one_scene_project(job.images_dir, script="hello earth")
-        runner = PipelineRunner(transcriber=fake_transcriber(
-            [("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
-        with self.assertRaises(PipelineError) as ctx:
+        pj = one_scene_project(job.images_dir, script="hello world")
+        runner = PipelineRunner(transcriber=fake_transcriber([("zzz", 0.0, 0.5)]))
+        with self.assertRaises(PipelineError):
             self._run(runner, pj, job.images_dir, job)
-        self.assertIn("REVIEW", str(ctx.exception))
+        log = (job.logs_dir / "pipeline.log").read_text(encoding="utf-8")
+        self.assertIn("Aligning scenes", log)
+        self.assertIn("timestamp:", log)
+        self.assertIn("Scene 1", log)
 
-        # allow_review lets the pipeline continue.
-        result = self._run(runner, pj, job.images_dir, job, allow_review=True)
-        self.assertTrue(result.output_video.is_file())
+    def test_review_within_ratio_allowed_with_warning(self):
+        # 20 scenes, 1 REVIEW -> ratio 0.05 == max_review_ratio, allowed.
+        job = self.manager.create_job()
+        pj = write_project_json(job.images_dir, [
+            {"scene_id": i, "script_text": "hello world",
+             "images": [f"scene_{i:03d}.png"]}
+            for i in range(1, 21)
+        ])
+        for i in range(1, 21):
+            make_image(job.images_dir / f"scene_{i:03d}.png")
+        runner = PipelineRunner(
+            transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]),
+            max_review_ratio=0.05)
+
+        with self._fake_alignment([("HIGH", 0.9)] * 19 + [("REVIEW", 0.6)]):
+            result = self._run(runner, pj, job.images_dir, job, render=False)
+
+        self.assertEqual(result.metadata["alignment_statuses"]["HIGH"], 19)
+        self.assertEqual(result.metadata["alignment_statuses"]["REVIEW"], 1)
+        self.assertTrue(result.metadata["alignment_warnings"])
+        self.assertTrue((job.intermediate_dir / "timeline.json").is_file())
+
+    def test_review_over_ratio_blocks(self):
+        job = self.manager.create_job()
+        pj = one_scene_project(job.images_dir)
+        runner = PipelineRunner(
+            transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
+        with self._fake_alignment([("REVIEW", 0.6)]):
+            with self.assertRaises(PipelineError) as ctx:
+                self._run(runner, pj, job.images_dir, job, render=False)
+        self.assertIn("Manual review required", str(ctx.exception))
+
+    def test_review_invalid_timestamps_block(self):
+        job = self.manager.create_job()
+        pj = one_scene_project(job.images_dir)
+        runner = PipelineRunner(
+            transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
+        with self._fake_alignment([("REVIEW_INVALID", 0.6)]):
+            with self.assertRaises(PipelineError) as ctx:
+                self._run(runner, pj, job.images_dir, job, render=False)
+        self.assertIn("invalid/unsafe timestamps", str(ctx.exception))
+
+    def test_failed_blocks_even_within_ratio(self):
+        job = self.manager.create_job()
+        pj = one_scene_project(job.images_dir)
+        runner = PipelineRunner(
+            transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]),
+            max_review_ratio=1.0)
+        with self._fake_alignment([("FAILED", 0.0)]):
+            with self.assertRaises(PipelineError) as ctx:
+                self._run(runner, pj, job.images_dir, job, render=False)
+        self.assertIn("could not be aligned confidently", str(ctx.exception))
+
+    def test_high_only_has_no_review_warnings(self):
+        job = self.manager.create_job()
+        pj = one_scene_project(job.images_dir)
+        runner = PipelineRunner(
+            transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
+        with self._fake_alignment([("HIGH", 0.9)]):
+            result = self._run(runner, pj, job.images_dir, job, render=False)
+        self.assertNotIn("alignment_warnings", result.metadata)
+        self.assertEqual(result.metadata["alignment_statuses"]["HIGH"], 1)
+
+    def test_max_review_ratio_is_configurable(self):
+        job = self.manager.create_job()
+        pj = one_scene_project(job.images_dir)
+        runner = PipelineRunner(
+            transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]),
+            max_review_ratio=1.0)
+        with self._fake_alignment([("REVIEW", 0.6)]):
+            result = self._run(runner, pj, job.images_dir, job, render=False)
+        self.assertEqual(result.metadata["alignment_statuses"]["REVIEW"], 1)
+
+    def _fake_alignment(self, specs):
+        from unittest import mock
+        from video_assembler.services.alignment.alignment_service import AlignmentDiagnostics
+
+        class _FakeAS:
+            def align_scenes(self, scenes, transcription):
+                diag = AlignmentDiagnostics()
+                aligned = []
+                n = max(len(scenes), 1)
+                step = 0.9 / n
+                for i, scene in enumerate(scenes):
+                    status, conf = specs[i % len(specs)]
+                    if status == "FAILED":
+                        scene.match_confidence = 0.0
+                        diag.add(scene.scene_id, {"status": "FAILED", "reason": "NO_MATCH_FOUND"})
+                    elif status == "REVIEW_INVALID":
+                        scene.match_confidence = conf
+                        scene.speech_start = None
+                        scene.speech_end = None
+                        diag.add(scene.scene_id, {"status": "REVIEW", "confidence": conf,
+                                                  "speech_start": None, "speech_end": None})
+                    else:
+                        start = round(0.02 + i * step, 3)
+                        end = round(0.02 + (i + 1) * step, 3)
+                        scene.speech_start = start
+                        scene.speech_end = end
+                        scene.match_confidence = conf
+                        diag.add(scene.scene_id, {"status": status, "confidence": conf,
+                                                  "speech_start": start, "speech_end": end})
+                    aligned.append(scene)
+                return aligned, diag
+
+        return mock.patch("video_assembler.services.pipeline_runner.AlignmentService",
+                          _FakeAS)
 
     def test_backend_exception_maps_to_friendly_error(self):
         job = self.manager.create_job()

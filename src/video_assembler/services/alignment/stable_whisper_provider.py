@@ -4,8 +4,9 @@ import stable_whisper
 from .provider_base import TranscriptionProvider, TranscriptionResult, TranscribedWord, TranscribedSegment
 
 class StableWhisperProvider(TranscriptionProvider):
-    def __init__(self, model_name: str = "base"):
+    def __init__(self, model_name: str = "base", no_speech_threshold: float = 0.9):
         self.model_name = model_name
+        self.no_speech_threshold = no_speech_threshold
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         # Load the model
         self.model = stable_whisper.load_model(model_name, device=self.device)
@@ -14,8 +15,13 @@ class StableWhisperProvider(TranscriptionProvider):
         start_time = time.time()
         
         # stable-ts alignment transcription
-        # word_timestamps=True is the default for stable-ts, but good to be explicit
-        result = self.model.transcribe(audio_path, word_timestamps=True)
+        # word_timestamps=True is the default for stable-ts, but good to be explicit.
+        # no_speech_threshold is raised above the stable-whisper default (0.6) so
+        # real speech windows are not discarded on long chunked audio. The default
+        # (0.6) silently drops genuine narration regions during chunk transcription
+        # (reproduced: chunk_003 loses scenes 100-102). 0.9 keeps such windows.
+        result = self.model.transcribe(audio_path, word_timestamps=True,
+                                       no_speech_threshold=self.no_speech_threshold)
         
         end_time = time.time()
         processing_seconds = end_time - start_time
@@ -26,6 +32,14 @@ class StableWhisperProvider(TranscriptionProvider):
         for seg in result.segments:
             seg_words = []
             for w in seg.words:
+                # Drop zero-width words: stable-whisper occasionally emits words
+                # where end == start (no duration). These are alignment artifacts,
+                # not real speech. The real acceptance test showed they corrupt
+                # scene alignment (duplicated "They're buying real estate, ..."
+                # at 965.44 degraded scene 141 from HIGH to REVIEW), so they are
+                # filtered out here.
+                if w.end - w.start < 1e-6:
+                    continue
                 tw = TranscribedWord(
                     word=w.word,
                     start=w.start,

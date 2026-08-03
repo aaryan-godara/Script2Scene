@@ -16,7 +16,6 @@ transcribed fresh on every run.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -24,7 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
-from video_assembler.services.alignment.provider_base import TranscriptionResult
+from video_assembler.services.alignment.transcription_cache import (
+    TranscriptionCacheError, load_transcription)
 from video_assembler.services.parser_service import ParserService
 from video_assembler.services.pipeline_runner import PipelineRunner, PipelineError
 
@@ -60,8 +60,12 @@ def main(argv=None) -> int:
     transcription = None
     if args.use_cached_alignment:
         print("using cached transcription.json (--use-cached-alignment); skipping Whisper")
-        transcription = TranscriptionResult(
-            **json.loads((intermediate / "transcription.json").read_text(encoding="utf-8")))
+        try:
+            transcription = load_transcription(intermediate / "transcription.json",
+                                               audio_path=audio_path)
+        except TranscriptionCacheError as e:
+            print(f"PIPELINE ERROR: {e}")
+            return 1
 
     runner = PipelineRunner(model_name="base")
     try:
