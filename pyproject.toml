@@ -1,0 +1,12 @@
+[project]
+name = "video-assembler"
+version = "0.1.0"
+description = "Automated Narration-to-Visual Video Assembly System"
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,60 @@
+{
+  "project": "golden_test",
+  "scenes": [
+    {
+      "scene_id": 1,
+      "script_text": "Every single day, more than 8,000 people die in the United States.",
+      "images": []
+    },
+    {
+      "scene_id": 2,
+      "script_text": "It's a statistic almost everyone hears... and almost everyone forgets.",
+      "images": []
+    },
+    {
+      "scene_id": 3,
+      "script_text": "But have you ever stopped to ask a different question?",
+      "images": []
+    },
+    {
+      "scene_id": 4,
+      "script_text": "Who makes money from death?",
+      "images": []
+    },
+    {
+      "scene_id": 5,
+      "script_text": "It sounds like the beginning of a crime documentary, but it's actually the foundation of a multi-billion-dollar industry.",
+      "images": []
+    },
+    {
+      "scene_id": 6,
+      "script_text": "And here's the part that surprises most people: some cemetery owners can continue generating revenue for decades—even after every available burial plot has already been sold.",
+      "images": []
+    },
+    {
+      "scene_id": 7,
+      "script_text": "Sounds impossible?",
+      "images": []
+    },
+    {
+      "scene_id": 8,
+      "script_text": "It isn't.",
+      "images": []
+    },
+    {
+      "scene_id": 9,
+      "script_text": "Welcome to one of America's most overlooked businesses.",
+      "images": []
+    },
+    {
+      "scene_id": 10,
+      "script_text": "Today, we're pulling back the curtain on an industry that quietly combines real estate, finance, long-term investing, and recurring revenue into one of the oldest business models ever created.",
+      "images": []
+    },
+    {
+      "scene_id": 11,
+      "script_text": "So... You Want To Own A Cemetery?",
+      "images": []
+    }
+  ]
+}

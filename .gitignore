@@ -1,0 +1,32 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated jobs / temporary data
+workspace/
+intermediate/
+output/
+render_temp/
+
+# User/project media
+*.mp3
+*.wav
+*.m4a
+*.mp4
+
+# Generated / uploaded images
+input/images/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

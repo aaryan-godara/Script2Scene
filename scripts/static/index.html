@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Golden Test Annotation Tool</title>
+    <!-- wavesurfer.js -->
+    <script src="https://unpkg.com/wavesurfer.js@7"></script>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #1e1e1e; color: #fff; }
+        .panel { background: #2d2d2d; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .flex { display: flex; gap: 10px; align-items: center; }
+        .btn { background: #4a4a4a; color: white; border: none; padding: 8px 12px; border-radius: 4px; cursor: pointer; }
+        .btn:hover { background: #5a5a5a; }
+        .btn-primary { background: #0066cc; }
+        .btn-primary:hover { background: #0077ee; }
+        .btn-danger { background: #cc3300; }
+        .script-box { font-size: 1.2em; line-height: 1.5; padding: 15px; background: #111; border-radius: 4px; border-left: 4px solid #0066cc; margin: 15px 0; }
+        #waveform { width: 100%; height: 128px; background: #111; margin: 15px 0; border-radius: 4px; }
+        .controls { display: flex; flex-wrap: wrap; gap: 8px; margin: 15px 0; }
+        .timestamp-box { background: #111; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 1.2em; text-align: center; flex: 1; }
+        .nav-controls { display: flex; justify-content: space-between; margin-top: 20px; }
+        .scene-list { max-height: 300px; overflow-y: auto; background: #111; padding: 10px; border-radius: 4px; }
+        .scene-item { padding: 8px; cursor: pointer; border-bottom: 1px solid #333; }
+        .scene-item:hover { background: #222; }
+        .scene-item.active { background: #0066cc; }
+        .completed { color: #4caf50; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <h1>Golden Test Annotation</h1>
+    
+    <div class="panel">
+        <div id="waveform"></div>
+        <div class="flex" style="justify-content: space-between;">
+            <div id="current-time" style="font-family: monospace; font-size: 1.5em; font-weight: bold; color: #4caf50;">0.000 s</div>
+            <button class="btn btn-primary" id="btn-play-pause">Play / Pause</button>
+        </div>
+        
+        <div class="controls">
+            <button class="btn" onclick="seek(-5)">-5s</button>
+            <button class="btn" onclick="seek(-1)">-1s</button>
+            <button class="btn" onclick="seek(-0.1)">-0.1s</button>
+            <button class="btn" onclick="seek(0.1)">+0.1s</button>
+            <button class="btn" onclick="seek(1)">+1s</button>
+            <button class="btn" onclick="seek(5)">+5s</button>
+        </div>
+    </div>
+
+    <div class="panel">
+        <div class="flex" style="justify-content: space-between;">
+            <h2 id="scene-title">Scene #</h2>
+            <div>
+                <button class="btn" id="btn-prev">&larr; Previous Scene</button>
+                <button class="btn" id="btn-next">Next Scene &rarr;</button>
+            </div>
+        </div>
+        
+        <div class="script-box" id="script-text">Loading script...</div>
+        
+        <div class="flex">
+            <div class="timestamp-box">
+                Start: <span id="lbl-start">--</span>
+                <br><button class="btn btn-primary" style="margin-top: 5px; width: 100%;" id="btn-mark-start">Mark Start</button>
+            </div>
+            <div class="timestamp-box">
+                End: <span id="lbl-end">--</span>
+                <br><button class="btn btn-danger" style="margin-top: 5px; width: 100%;" id="btn-mark-end">Mark End</button>
+            </div>
+        </div>
+        
+        <div style="margin-top: 15px;">
+            <label>Notes:</label>
+            <input type="text" id="txt-notes" style="width: 100%; padding: 8px; background: #111; border: 1px solid #333; color: white; margin-top: 5px; border-radius: 4px;">
+        </div>
+    </div>
+    
+    <div class="panel">
+        <div class="flex" style="justify-content: space-between;">
+            <h2>Scene Overview</h2>
+            <button class="btn btn-primary" id="btn-save">Save Ground Truth</button>
+        </div>
+        <div class="scene-list" id="scene-list"></div>
+    </div>
+
+    <script>
+        let ws;
+        let projectData = null;
+        let groundTruthData = null;
+        let currentSceneIndex = 0;
+        
+        // Initialize Wavesurfer
+        ws = WaveSurfer.create({
+            container: '#waveform',
+            waveColor: '#4a4a4a',
+            progressColor: '#0066cc',
+            cursorColor: '#ff0000',
+            barWidth: 2,
+            height: 128,
+            normalize: true
+        });
+        
+        ws.load('/api/audio?t=' + new Date().getTime());
+        
+        ws.on('audioprocess', () => {
+            document.getElementById('current-time').innerText = ws.getCurrentTime().toFixed(3) + ' s';
+        });
+        
+        ws.on('seek', () => {
+            document.getElementById('current-time').innerText = ws.getCurrentTime().toFixed(3) + ' s';
+        });
+        
+        document.getElementById('btn-play-pause').addEventListener('click', () => ws.playPause());
+        
+        function seek(seconds) {
+            const time = ws.getCurrentTime() + seconds;
+            ws.setTime(Math.max(0, Math.min(time, ws.getDuration())));
+        }
+        
+        // Load data
+        async function loadData() {
+            try {
+                const projRes = await fetch('/api/project');
+                projectData = await projRes.json();
+                
+                const gtRes = await fetch('/api/ground_truth');
+                groundTruthData = await gtRes.json();
+                
+                // Initialize GT annotations if empty
+                if (!groundTruthData.annotations) {
+                    groundTruthData.annotations = [];
+                }
+                
+                renderSceneList();
+                loadScene(0);
+                
+            } catch (err) {
+                alert("Error loading data: " + err.message);
+            }
+        }
+        
+        function renderSceneList() {
+            const list = document.getElementById('scene-list');
+            list.innerHTML = '';
+            
+            projectData.scenes.forEach((scene, index) => {
+                const ann = groundTruthData.annotations.find(a => a.scene_id === scene.scene_id);
+                const isComplete = ann && ann.speech_start !== undefined && ann.speech_end !== undefined;
+                
+                const div = document.createElement('div');
+                div.className = `scene-item ${index === currentSceneIndex ? 'active' : ''}`;
+                div.innerHTML = `Scene ${scene.scene_id} ${isComplete ? '<span class="completed">✓</span>' : ''} - <small>${scene.script_text.substring(0, 30)}...</small>`;
+                div.onclick = () => loadScene(index);
+                list.appendChild(div);
+            });
+        }
+        
+        function loadScene(index) {
+            if (index < 0 || index >= projectData.scenes.length) return;
+            
+            currentSceneIndex = index;
+            const scene = projectData.scenes[index];
+            const ann = groundTruthData.annotations.find(a => a.scene_id === scene.scene_id) || { scene_id: scene.scene_id };
+            
+            document.getElementById('scene-title').innerText = `Scene ${scene.scene_id}`;
+            document.getElementById('script-text').innerText = scene.script_text;
+            
+            document.getElementById('lbl-start').innerText = ann.speech_start !== undefined ? ann.speech_start.toFixed(3) : '--';
+            document.getElementById('lbl-end').innerText = ann.speech_end !== undefined ? ann.speech_end.toFixed(3) : '--';
+            document.getElementById('txt-notes').value = ann.notes || '';
+            
+            renderSceneList();
+            
+            // Jump to start if available
+            if (ann.speech_start !== undefined && ws.isReady) {
+                ws.setTime(ann.speech_start);
+            }
+        }
+        
+        function updateAnnotation(updates) {
+            const scene = projectData.scenes[currentSceneIndex];
+            let ann = groundTruthData.annotations.find(a => a.scene_id === scene.scene_id);
+            if (!ann) {
+                ann = { scene_id: scene.scene_id };
+                groundTruthData.annotations.push(ann);
+            }
+            Object.assign(ann, updates);
+            
+            groundTruthData.project = projectData.project || "golden_test";
+            
+            if (updates.speech_start !== undefined) document.getElementById('lbl-start').innerText = updates.speech_start.toFixed(3);
+            if (updates.speech_end !== undefined) document.getElementById('lbl-end').innerText = updates.speech_end.toFixed(3);
+            
+            renderSceneList();
+        }
+        
+        document.getElementById('btn-mark-start').addEventListener('click', () => {
+            updateAnnotation({ speech_start: Number(ws.getCurrentTime().toFixed(3)) });
+        });
+        
+        document.getElementById('btn-mark-end').addEventListener('click', () => {
+            updateAnnotation({ speech_end: Number(ws.getCurrentTime().toFixed(3)) });
+        });
+        
+        document.getElementById('txt-notes').addEventListener('change', (e) => {
+            updateAnnotation({ notes: e.target.value });
+        });
+        
+        document.getElementById('btn-prev').addEventListener('click', () => loadScene(currentSceneIndex - 1));
+        document.getElementById('btn-next').addEventListener('click', () => loadScene(currentSceneIndex + 1));
+        
+        document.getElementById('btn-save').addEventListener('click', async () => {
+            try {
+                const res = await fetch('/api/save', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(groundTruthData)
+                });
+                if (res.ok) alert('Saved successfully!');
+                else alert('Failed to save.');
+            } catch (err) {
+                alert('Save error: ' + err.message);
+            }
+        });
+        
+        // Auto-save on page unload
+        window.addEventListener('beforeunload', () => {
+            navigator.sendBeacon('/api/save', JSON.stringify(groundTruthData));
+        });
+        
+        ws.on('ready', () => {
+            loadData();
+        });
+        
+        // Keyboard shortcuts
+        document.addEventListener('keydown', (e) => {
+            if (e.target.tagName === 'INPUT') return;
+            
+            if (e.code === 'Space') { e.preventDefault(); ws.playPause(); }
+            if (e.code === 'ArrowLeft') seek(-1);
+            if (e.code === 'ArrowRight') seek(1);
+            if (e.code === 'BracketLeft') updateAnnotation({ speech_start: Number(ws.getCurrentTime().toFixed(3)) });
+            if (e.code === 'BracketRight') updateAnnotation({ speech_end: Number(ws.getCurrentTime().toFixed(3)) });
+        });
+    </script>
+</body>
+</html>
