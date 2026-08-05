@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 class TranscribedWord(BaseModel):
@@ -33,6 +33,13 @@ class TranscriptionResult(BaseModel):
     chunk_boundaries: List[List[float]] = Field(default_factory=list)
     words_per_chunk: List[int] = Field(default_factory=list)
     duplicates_removed: Optional[int] = None
+    # EOF tail-recovery configuration used to build this transcription. These are
+    # part of the cache identity: a cache built with a different tail-recovery
+    # algorithm must not be silently reused.
+    tail_recovery_enabled: Optional[bool] = None
+    tail_gap_trigger_seconds: Optional[float] = None
+    tail_recovery_context_seconds: Optional[float] = None
+    tail_recovery: Optional[Dict] = None
 
 class TranscriptionProvider(ABC):
     @abstractmethod

@@ -10,6 +10,7 @@ workspace/
 intermediate/
 output/
 render_temp/
+tmp_*/
 
 # User/project media
 *.mp3

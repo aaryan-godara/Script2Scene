@@ -1,11 +1,65 @@
 import subprocess
 import json
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
+
+
+def tail_has_acoustic_energy(audio_path: Path, tail_start: float,
+                             end_seconds: Optional[float] = None, *,
+                             sample_rate: int = 16000, window_ms: int = 10,
+                             silence_threshold_db: float = -40.0,
+                             energy_floor: float = 1e-10) -> Tuple[bool, float]:
+    """Whether the audio region [tail_start, end_seconds) has speech-like energy.
+
+    Follows the same energy convention as AcousticBoundaryRefiner: the audio is
+    decoded to 16 kHz mono PCM, a short-window RMS envelope is computed (10 ms
+    frames), and the silence threshold is -40 dB relative to the global peak.
+    Returns (has_energy, max_db_above_threshold). Used to decide whether a
+    transcription that ends early really dropped narration as opposed to
+    ending on legitimate trailing silence.
+    """
+    import numpy as np
+
+    cmd = [
+        "ffmpeg", "-i", str(audio_path),
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate), "-ac", "1",
+        "-loglevel", "error", "pipe:1",
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.decode(errors="replace"))
+    samples = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    n = int(sample_rate * window_ms / 1000)
+    n_frames = len(samples) // n
+    if n_frames == 0:
+        return False, float("-inf")
+    frames = samples[: n_frames * n].reshape(n_frames, n)
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1) + energy_floor)
+    peak = float(np.max(rms))
+    if peak <= 0:
+        return False, float("-inf")
+    threshold = peak * (10.0 ** (silence_threshold_db / 20.0))
+    frame_dt = window_ms / 1000.0
+    frame_start = np.arange(n_frames) * frame_dt
+    if end_seconds is None:
+        mask = frame_start >= tail_start
+    else:
+        mask = (frame_start >= tail_start) & (frame_start < end_seconds)
+    region = rms[mask]
+    if region.size == 0:
+        return False, float("-inf")
+    max_db = float(20.0 * np.log10(np.max(region) / threshold)) if threshold > 0 else float("-inf")
+    return bool(np.any(region >= threshold)), max_db
+
 
 class AudioService:
     def __init__(self, project_dir: Path):
         self.project_dir = Path(project_dir)
+
+    def tail_has_acoustic_energy(self, audio_path: Path, tail_start: float,
+                                 end_seconds: Optional[float] = None) -> bool:
+        return tail_has_acoustic_energy(audio_path, tail_start, end_seconds)[0]
 
     def get_audio_metadata(self, audio_path: Path) -> Dict[str, Any]:
         """Uses ffprobe to extract audio metadata."""

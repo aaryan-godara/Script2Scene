@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 from .provider_base import TranscriptionResult
 
@@ -46,12 +46,14 @@ def save_transcription(result: TranscriptionResult, path: str | Path,
     return path
 
 
-def load_transcription(path: str | Path, audio_path: str | Path | None = None
+def load_transcription(path: str | Path, audio_path: str | Path | None = None,
+                       expected_config: Optional[Dict] = None
                        ) -> TranscriptionResult:
     """Loads and optionally validates a cached transcription.
 
-    Raises TranscriptionCacheError when the file is missing, malformed, or its
-    audio SHA-256 does not match ``audio_path``.
+    Raises TranscriptionCacheError when the file is missing, malformed, its
+    audio SHA-256 does not match ``audio_path``, or (when ``expected_config``
+    is supplied) it was built with a different transcription configuration.
     """
     path = Path(path)
     if not path.is_file():
@@ -73,13 +75,23 @@ def load_transcription(path: str | Path, audio_path: str | Path | None = None
             raise TranscriptionCacheError(
                 f"Cached transcription does not match current narration "
                 f"(audio changed). Refusing to reuse: {path}")
+
+    if expected_config:
+        for key, value in expected_config.items():
+            actual_value = getattr(result, key, None)
+            if actual_value != value:
+                raise TranscriptionCacheError(
+                    f"Cached transcription was built with a different transcription "
+                    f"configuration ({key}={actual_value!r} != expected {value!r}). "
+                    f"Refusing to reuse: {path}")
     return result
 
 
-def transcription_is_current(path: str | Path, audio_path: str | Path) -> bool:
+def transcription_is_current(path: str | Path, audio_path: str | Path,
+                             expected_config: Optional[Dict] = None) -> bool:
     """True only when a cache exists and its audio SHA-256 matches the audio."""
     try:
-        load_transcription(path, audio_path)
+        load_transcription(path, audio_path, expected_config=expected_config)
         return True
     except TranscriptionCacheError:
         return False

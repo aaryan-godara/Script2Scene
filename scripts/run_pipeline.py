@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from video_assembler.services.alignment.chunked_transcription_provider import ChunkingConfig
 from video_assembler.services.alignment.transcription_cache import (
     TranscriptionCacheError, load_transcription)
 from video_assembler.services.parser_service import ParserService
@@ -61,8 +62,12 @@ def main(argv=None) -> int:
     if args.use_cached_alignment:
         print("using cached transcription.json (--use-cached-alignment); skipping Whisper")
         try:
-            transcription = load_transcription(intermediate / "transcription.json",
-                                               audio_path=audio_path)
+            # Tail-recovery config forms part of the cache identity: a cache built
+            # before tail recovery existed must not be reused silently.
+            loaded = load_transcription(intermediate / "transcription.json",
+                                        audio_path=audio_path,
+                                        expected_config=ChunkingConfig().tail_recovery_identity())
+            transcription = loaded
         except TranscriptionCacheError as e:
             print(f"PIPELINE ERROR: {e}")
             return 1
