@@ -5,6 +5,18 @@ description = "Automated Narration-to-Visual Video Assembly System"
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.0.0",
+    "numpy>=1.26",
+    "torch>=2.5",
+    "stable-whisper>=2.19.1",
+    "num2words>=0.5",
+    "gradio>=6.22.0",
+    "fastapi>=0.100",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
 ]
 
 [build-system]

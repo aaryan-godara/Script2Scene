@@ -19,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List
 
-ROOT = Path(r"D:\RAHUL SIR\automation\VIDEO CREATOR")
+ROOT = Path(__file__).resolve().parents[4]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
