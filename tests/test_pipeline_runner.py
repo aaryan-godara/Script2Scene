@@ -49,12 +49,12 @@ class PipelineRunnerTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _run(self, runner, scenes_project, images_dir, job, **kwargs):
+    def _run(self, runner, scenes_project, images_dir, job, *, narration=None, **kwargs):
         from video_assembler.services.parser_service import ParserService
         project_input = ParserService().parse_input_json(scenes_project)
         return runner.run(
             project_input=project_input,
-            narration=self.narration,
+            narration=narration or self.narration,
             images_dir=images_dir,
             intermediate_dir=job.intermediate_dir,
             output_dir=job.output_dir,
@@ -66,7 +66,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_run_produces_synchronized_video(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(transcriber=fake_transcriber(
+        runner = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber(
             [("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
         result = self._run(runner, pj, job.images_dir, job)
 
@@ -86,14 +86,19 @@ class PipelineRunnerTest(unittest.TestCase):
         pj_a = one_scene_project(job_a.images_dir, name="truck_a")
         job_b = self.manager.create_job()
         pj_b = one_scene_project(job_b.images_dir, script="bye world", name="truck_b")
+        # Distinct narration bytes: the persistent transcription cache is keyed
+        # by audio identity, so two jobs sharing byte-identical audio WOULD
+        # legitimately reuse the cache. Different bytes keep this test focused
+        # on job-directory isolation.
+        narration_b = synth_audio(self.root / "narration_b.wav", 1.3)
 
-        runner = PipelineRunner(transcriber=fake_transcriber(
+        runner = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber(
             [("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
         res_a = self._run(runner, pj_a, job_a.images_dir, job_a)
 
-        runner_b = PipelineRunner(transcriber=fake_transcriber(
+        runner_b = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber(
             [("bye", 0.0, 0.3), ("world", 0.3, 0.6)]))
-        res_b = self._run(runner_b, pj_b, job_b.images_dir, job_b)
+        res_b = self._run(runner_b, pj_b, job_b.images_dir, job_b, narration=narration_b)
 
         self.assertNotEqual(res_a.output_video, res_b.output_video)
         self.assertTrue(res_a.output_video.exists())
@@ -113,7 +118,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_alignment_failure_stops_generation(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(transcriber=fake_transcriber([("zzz", 0.0, 0.5)]))
+        runner = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber([("zzz", 0.0, 0.5)]))
         with self.assertRaises(PipelineError) as ctx:
             self._run(runner, pj, job.images_dir, job)
         self.assertIn("could not be aligned confidently", str(ctx.exception))
@@ -121,7 +126,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_alignment_failure_writes_pipeline_log(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir, script="hello world")
-        runner = PipelineRunner(transcriber=fake_transcriber([("zzz", 0.0, 0.5)]))
+        runner = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber([("zzz", 0.0, 0.5)]))
         with self.assertRaises(PipelineError):
             self._run(runner, pj, job.images_dir, job)
         log = (job.logs_dir / "pipeline.log").read_text(encoding="utf-8")
@@ -139,7 +144,7 @@ class PipelineRunnerTest(unittest.TestCase):
         ])
         for i in range(1, 21):
             make_image(job.images_dir / f"scene_{i:03d}.png")
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]),
             max_review_ratio=0.05)
 
@@ -154,7 +159,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_review_over_ratio_blocks(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
         with self._fake_alignment([("REVIEW", 0.6)]):
             with self.assertRaises(PipelineError) as ctx:
@@ -164,7 +169,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_review_invalid_timestamps_block(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
         with self._fake_alignment([("REVIEW_INVALID", 0.6)]):
             with self.assertRaises(PipelineError) as ctx:
@@ -174,7 +179,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_failed_blocks_even_within_ratio(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]),
             max_review_ratio=1.0)
         with self._fake_alignment([("FAILED", 0.0)]):
@@ -185,7 +190,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_high_only_has_no_review_warnings(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
         with self._fake_alignment([("HIGH", 0.9)]):
             result = self._run(runner, pj, job.images_dir, job, render=False)
@@ -195,7 +200,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_max_review_ratio_is_configurable(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3), ("world", 0.3, 0.6)]),
             max_review_ratio=1.0)
         with self._fake_alignment([("REVIEW", 0.6)]):
@@ -240,7 +245,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_backend_exception_maps_to_friendly_error(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(
+        runner = PipelineRunner(cache_root=self.root / "cache",
             transcriber=fake_transcriber([("hello", 0.0, 0.3)],
                                          error=RuntimeError("boom")))
         with self.assertRaises(PipelineError) as ctx:
@@ -255,7 +260,7 @@ class PipelineRunnerTest(unittest.TestCase):
         pj = write_project_json(job.images_dir, [
             {"scene_id": 1, "script_text": "a", "images": ["missing.png"]},
         ])
-        runner = PipelineRunner(transcriber=fake_transcriber([("a", 0.0, 0.3)]))
+        runner = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber([("a", 0.0, 0.3)]))
         with self.assertRaises(PipelineError) as ctx:
             self._run(runner, pj, job.images_dir, job)
         self.assertIn("Project validation failed", str(ctx.exception))
@@ -264,7 +269,7 @@ class PipelineRunnerTest(unittest.TestCase):
     def test_no_render_writes_timeline_only(self):
         job = self.manager.create_job()
         pj = one_scene_project(job.images_dir)
-        runner = PipelineRunner(transcriber=fake_transcriber(
+        runner = PipelineRunner(cache_root=self.root / "cache",transcriber=fake_transcriber(
             [("hello", 0.0, 0.3), ("world", 0.3, 0.6)]))
         result = runner.run(
             project_input=__import__("video_assembler.services.parser_service",

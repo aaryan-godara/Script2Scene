@@ -31,6 +31,7 @@ from pydantic import BaseModel
 
 from .provider_base import (TranscribedSegment, TranscribedWord,
                             TranscriptionProvider, TranscriptionResult)
+from .merge_utils import match_sequences, merge_chunk
 from .text_normalizer import TextNormalizer
 
 
@@ -230,29 +231,7 @@ class ChunkedTranscriptionProvider(TranscriptionProvider):
         from a chunk boundary). No merged word is dropped unless a strictly
         better duplicate replaces it, so legitimate repeated words survive.
         """
-        overlap_end = prev_end
-
-        # only the tail of the merged transcript can be re-captured by this chunk
-        prev_candidates = merged[-len(words):]
-
-        matches, _ = self._match_sequences(prev_candidates, words)
-
-        dup_cur_ids = set()
-        for pi, cj in matches:
-            dup_cur_ids.add(cj)
-            pw = prev_candidates[pi]
-            cw = words[cj]
-            pw_dist = min(pw.start - prev_start, prev_end - pw.end)
-            cw_dist = min(cw.start - g_start, overlap_end - cw.end)
-            if cw_dist > pw_dist:
-                for idx, w in enumerate(merged):
-                    if w is pw:
-                        merged[idx] = cw
-                        break
-
-        # keep non-duplicate words from this chunk
-        to_add = [w for j, w in enumerate(words) if j not in dup_cur_ids]
-        return merged + to_add, len(matches)
+        return merge_chunk(merged, words, g_start, prev_start, prev_end)
 
     # -------------------------------------------------------- EOF tail recovery
     def _tail_energy_detected(self, audio_path: Path, tail_start: float,
@@ -346,26 +325,7 @@ class ChunkedTranscriptionProvider(TranscriptionProvider):
         Walks both lists in order; a pair matches when normalized text is
         equal. Returns (matched (prev,cur) index pairs, unmatched cur indices).
         """
-        normalizer = TextNormalizer()
-        i = 0
-        j = 0
-        matches: List[Tuple[int, int]] = []
-        unmatched_cur: List[int] = []
-        while j < len(cur_list):
-            if i < len(prev_list) and normalizer.normalize(prev_list[i].word) \
-                    == normalizer.normalize(cur_list[j].word) \
-                    and prev_list[i].word.strip():
-                matches.append((i, j))
-                i += 1
-                j += 1
-            elif i < len(prev_list) and prev_list[i].end < cur_list[j].start:
-                # prev captured a word the current chunk missed -> keep prev
-                i += 1
-            else:
-                # current chunk has a word the previous chunk missed -> keep cur
-                unmatched_cur.append(j)
-                j += 1
-        return matches, unmatched_cur
+        return match_sequences(prev_list, cur_list)
 
     # ------------------------------------------------------------- helpers
     @staticmethod

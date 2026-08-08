@@ -24,6 +24,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from video_assembler.models import ProjectInput, Timeline
 from video_assembler.services.alignment.alignment_service import AlignmentService
+from video_assembler.services.alignment.failed_region_recovery import (
+    FailedRegionRecoveryEngine, rebuild_transcription)
+from video_assembler.services.alignment.persistent_transcription_cache import (
+    PersistentTranscriptionCache, TranscriptionIdentityConfig, audio_sha256)
 from video_assembler.services.audio_service import AudioService
 from video_assembler.services.project_validator import ProjectValidator
 from video_assembler.services.render_service import RenderConfig, RenderService
@@ -79,8 +83,15 @@ class PipelineRunner:
     ]
 
     def __init__(self, model_name: str = "base", transcriber: Optional[Callable[[str], object]] = None,
-                 chunking_config: object = None, max_review_ratio: float = 0.05):
+                 chunking_config: object = None, max_review_ratio: float = 0.05,
+                 cache_root: Optional[Path | str] = None,
+                 identity: Optional[TranscriptionIdentityConfig] = None,
+                 auto_recovery: bool = True,
+                 collapse_region: Optional[Tuple[float, float]] = None):
         self.model_name = model_name
+        # Optional alignment-only ASR stutter collapse window (e.g. a Whisper
+        # stutter-damaged region). Default None keeps production behavior.
+        self.collapse_region = collapse_region
         # Optional injection point (used by tests to avoid running Whisper).
         self._transcriber = transcriber
         self._chunking_config = chunking_config
@@ -88,6 +99,37 @@ class PipelineRunner:
         # the project stays at or below this ratio. Above it, manual review is
         # required. FAILED scenes are always hard blockers regardless of this.
         self.max_review_ratio = float(max_review_ratio)
+        # Persistent transcription cache location (keyed by audio+config identity).
+        self.cache_root = Path(cache_root) if cache_root else Path("workspace/cache/transcriptions")
+        # Explicit identity override (tests); otherwise derived from model+chunking.
+        self._identity = identity
+        # Automatic failed-region recovery between alignment and the render gate.
+        self.auto_recovery = auto_recovery
+        # Lazily-created real whisper provider shared across transcription and
+        # recovery so the model is not reloaded for every failed region.
+        self._provider = None
+
+    # ----------------------------------------------------------------- identity
+    def transcription_identity(self) -> TranscriptionIdentityConfig:
+        if self._identity is not None:
+            return self._identity
+        cfg = self._chunking_config
+        return TranscriptionIdentityConfig(
+            provider="stable_whisper",
+            model=self.model_name,
+            no_speech_threshold=0.9,
+            chunking_enabled=bool(getattr(cfg, "chunking_enabled", True)),
+            chunk_duration_seconds=float(getattr(cfg, "chunk_duration_seconds", 180.0)),
+            overlap_seconds=float(getattr(cfg, "overlap_seconds", 10.0)),
+            long_audio_threshold_seconds=float(getattr(cfg, "long_audio_threshold_seconds", 300.0)),
+            dedup_time_tolerance=float(getattr(cfg, "dedup_time_tolerance", 1.5)),
+            tail_recovery_enabled=bool(getattr(cfg, "tail_recovery_enabled", True)),
+            tail_gap_trigger_seconds=float(getattr(cfg, "tail_gap_trigger_seconds", 2.0)),
+            tail_recovery_context_seconds=float(getattr(cfg, "tail_recovery_context_seconds", 90.0)),
+        )
+
+    def persistent_cache(self) -> PersistentTranscriptionCache:
+        return PersistentTranscriptionCache(self.cache_root, self.transcription_identity())
 
     # ------------------------------------------------------------------ helpers
     def _stage(self, name: str, friendly: str, fn: Callable, progress: Optional[ProgressFn],
@@ -127,19 +169,127 @@ class PipelineRunner:
         lines.append(traceback.format_exc())
         log.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def _get_provider(self):
+        """Lazily builds the real whisper provider ONCE (shared with recovery)."""
+        if self._provider is None and self._transcriber is None:
+            from video_assembler.services.alignment.stable_whisper_provider import StableWhisperProvider
+            self._provider = StableWhisperProvider(model_name=self.model_name)
+        return self._provider
+
+    def _transcribe_provider(self, audio_path: str) -> object:
+        """Runs transcription for a single clip via the injected or real provider."""
+        if self._transcriber is not None:
+            return self._transcriber(audio_path)
+        return self._get_provider().transcribe(audio_path)
+
     def _transcribe(self, narration: Path, intermediate_dir: Path) -> object:
         if self._transcriber is not None:
             return self._transcriber(str(narration))
         from video_assembler.services.alignment.chunked_transcription_provider import (
             ChunkedTranscriptionProvider, ChunkingConfig)
         from video_assembler.services.alignment.stable_whisper_provider import StableWhisperProvider
-        inner = StableWhisperProvider(model_name=self.model_name)
+        inner = self._get_provider()
         config = self._chunking_config or ChunkingConfig()
         provider = ChunkedTranscriptionProvider(inner, config=config)
         chunk_dir = intermediate_dir / "transcription_chunks"
         return provider.transcribe(str(narration), chunk_dir=str(chunk_dir))
 
-    # --------------------------------------------------------------------- run
+    def _resolve_transcription(self, narration: Path, intermediate_dir: Path):
+        """Persistent-cache-aware transcription resolution.
+
+        Returns (transcription, source, cache_meta) where source is one of
+        "persistent_cache" | "fresh_whisper". When a persistent cache hit exists
+        for the identical audio+config, Whisper is not re-run.
+        """
+        sha = audio_sha256(narration)
+        cache = self.persistent_cache()
+        cached = cache.load(sha)
+        if cached is not None:
+            transcription = cached
+            source = "persistent_cache"
+            meta = {
+                "source": source,
+                "persistent_cache_key": cache.entry_dir(sha).name,
+                "cache_version": cache.schema_version,
+                "audio_sha256": sha,
+            }
+            return transcription, source, meta, cache
+
+        transcription = self._transcribe(narration, intermediate_dir)
+        transcription.audio_sha256 = sha
+        cache.save(transcription, sha, source="fresh_whisper")
+        meta = {
+            "source": "fresh_whisper",
+            "persistent_cache_key": cache.entry_dir(sha).name,
+            "cache_version": cache.schema_version,
+            "audio_sha256": sha,
+        }
+        return transcription, "fresh_whisper", meta, cache
+
+    def _persist_recovered(self, cache: PersistentTranscriptionCache,
+                           transcription: object, sha: str,
+                           recovered_regions: List, recovered_scene_ids: List,
+                           tail_triggered: bool) -> None:
+        try:
+            cache.save(
+                transcription, sha, source="recovered_cache",
+                metadata_extra={
+                    "recovery_applied": True,
+                    "recovery_passes": len(recovered_regions),
+                    "recovered_regions": recovered_regions,
+                    "recovered_scene_ids": recovered_scene_ids,
+                    "tail_recovery_triggered": tail_triggered,
+                })
+        except Exception:  # noqa: BLE001 - cache write is best-effort
+            pass
+
+    def _auto_recover(self, scenes, transcription: object, narration: Path,
+                      intermediate_dir: Path, audio_duration: float):
+        """Runs bounded failed-region recovery passes, re-aligning after each.
+
+        Returns (aligned_scenes, transcription, diagnostics, statuses,
+                 audit_log, succeeded). Automatic recovery never promotes
+        scenes; the unchanged AlignmentService re-evaluates every scene.
+        Returns None when recovery is disabled (callers keep base alignment).
+        """
+        cfg = self.transcription_identity()
+        if not cfg.failed_region_recovery_enabled or not self.auto_recovery:
+            return None
+        svc = AudioService(narration.parent)
+        engine = FailedRegionRecoveryEngine(
+            self._transcribe_provider, svc, narration,
+            Path(intermediate_dir) / "transcription_chunks", cfg)
+        audit: List[Dict] = []
+        transcription = rebuild_transcription(transcription, list(transcription.words))
+
+        for pass_no in range(1, cfg.max_recovery_passes + 1):
+            aligned, diag, statuses = self._align_scenes(scenes, transcription)
+            failed = [sid for sid, st in statuses.items() if st == "FAILED"]
+            if not failed:
+                return aligned, transcription, diag, statuses, audit, True
+            new_words, pass_audit = engine.recover_pass(
+                list(transcription.words), scenes, statuses, diag,
+                audio_duration, pass_no)
+            audit.extend(pass_audit)
+            added = len(new_words) - len(transcription.words)
+            if added <= 0:
+                # nothing recovered this pass; do not spin.
+                break
+            transcription = rebuild_transcription(transcription, new_words)
+
+        aligned, diag, statuses = self._align_scenes(scenes, transcription)
+        return aligned, transcription, diag, statuses, audit, bool(audit)
+
+    def _align_scenes(self, scenes, transcription: object):
+        """Runs the unchanged AlignmentService and returns (aligned, diag, statuses)."""
+        if self.collapse_region is not None:
+            aligned, diag = AlignmentService().align_scenes(
+                scenes, transcription, collapse_region=self.collapse_region)
+        else:
+            aligned, diag = AlignmentService().align_scenes(scenes, transcription)
+        statuses = {sid: d.get("status") for sid, d in diag.diagnostics.items()}
+        return aligned, diag, statuses
+
     def run(
         self,
         project_input: ProjectInput,
@@ -181,23 +331,85 @@ class PipelineRunner:
         if audio_duration <= 0:
             raise PipelineError("Narration could not be decoded (zero duration).")
 
+        cache_meta = {}
+        recovered_scene_ids: List[int] = []
+        recovery_regions: List[Dict] = []
+        tail_recovery_triggered = False
+        transcription_source = "external"
+
         if transcribe:
-            transcription = self._stage(
-                "Transcribing narration...", "Whisper transcription",
-                lambda: self._transcribe(narration, intermediate_dir), progress, log, stages)
+            transcription, transcription_source, cache_meta, persistent_cache = \
+                self._stage(
+                    "Transcribing narration...", "Whisper transcription",
+                    lambda: self._resolve_transcription(narration, intermediate_dir),
+                    progress, log, stages)
             from video_assembler.services.alignment.transcription_cache import save_transcription
             save_transcription(transcription, intermediate_dir / "transcription.json",
                                audio_path=narration)
+            (intermediate_dir / "transcription_cache.json").write_text(
+                json.dumps(cache_meta, indent=2), encoding="utf-8")
 
         def _align():
-            aligned, diagnostics = AlignmentService().align_scenes(project_input.scenes, transcription)
-            statuses = {sid: d.get("status") for sid, d in diagnostics.diagnostics.items()}
-            warnings = self._check_alignment_gate(statuses, diagnostics, audio_duration)
-            return aligned, diagnostics, statuses, warnings
+            aligned, diagnostics, statuses = self._align_scenes(
+                project_input.scenes, transcription)
+            return aligned, diagnostics, statuses
 
-        aligned_scenes, diagnostics, statuses, alignment_warnings = self._stage(
+        aligned_scenes, diagnostics, statuses = self._stage(
             "Aligning scenes...", "Scene alignment",
             lambda: _align(), progress, log, stages)
+
+        # --- automatic failed-region local recovery + numeric validation -------
+        recovery_audit: List[Dict] = []
+        if transcription_source != "external":
+            recovered = self._auto_recover(
+                project_input.scenes, transcription, narration,
+                intermediate_dir, audio_duration)
+            if recovered is not None:
+                aligned_scenes, transcription, diagnostics, statuses, recovery_audit, _ = recovered
+                self._stage(
+                    "Recovering failed regions...", "Local recovery",
+                    lambda: None, progress, log, stages)
+                if recovery_audit:
+                    for entry in recovery_audit:
+                        recovery_regions.append({
+                            "window_start": entry.get("window_start"),
+                            "window_end": entry.get("window_end"),
+                            "pass": entry.get("pass"),
+                            "scene_group": entry.get("scene_group"),
+                        })
+                        recovered_scene_ids.extend(entry.get("scene_group") or [])
+                    recovered_scene_ids = sorted(set(recovered_scene_ids))
+                    tail_recovery_triggered = bool(
+                        (transcription.tail_recovery or {}).get("tail_recovery_triggered"))
+                    self._persist_recovered(
+                        persistent_cache, transcription,
+                        cache_meta.get("audio_sha256") or audio_sha256(narration),
+                        recovery_regions, recovered_scene_ids, tail_recovery_triggered)
+                    # refresh the job copy with the recovered transcription
+                    save_transcription(
+                        transcription, intermediate_dir / "transcription.json",
+                        audio_path=narration)
+                    (intermediate_dir / "recovery_log.json").write_text(
+                        json.dumps(recovery_audit, indent=2), encoding="utf-8")
+                    cache_meta["source"] = "recovered_cache"
+                    cache_meta["recovery_applied"] = True
+                    (intermediate_dir / "transcription_cache.json").write_text(
+                        json.dumps(cache_meta, indent=2), encoding="utf-8")
+
+        # Write an informational alignment report before the gate runs so a
+        # manual reviewer always has the evidence even when generation is
+        # stopped by a hard FAILED block or an over-limit REVIEW share.
+        try:
+            from video_assembler.services.alignment.review_report import write_review_report
+            write_review_report(intermediate_dir / "alignment_review.json",
+                                aligned_scenes, statuses, diagnostics, transcription)
+        except Exception:  # noqa: BLE001 - a review report must never block the run
+            pass
+
+        alignment_warnings = self._stage(
+            "Aligning scenes...", "Scene alignment",
+            lambda: self._check_alignment_gate(statuses, diagnostics, audio_duration),
+            progress, log, stages)
 
         (intermediate_dir / "alignment.json").write_text(
             json.dumps([{
@@ -206,14 +418,20 @@ class PipelineRunner:
                 "speech_end": s.speech_end,
                 "status": statuses.get(s.scene_id, "FAILED"),
                 "confidence": s.match_confidence,
+                **{k: v for k, v in diagnostics.diagnostics.get(s.scene_id, {}).items()
+                   if k in ("numeric_match", "warning_type",
+                            "canonical_numeric_values", "asr_numeric_values")},
             } for s in aligned_scenes], indent=2), encoding="utf-8")
 
         review_scene_ids = {sid for sid, st in statuses.items() if st == "REVIEW"}
         for sc in aligned_scenes:
             if sc.scene_id in review_scene_ids:
+                diag = diagnostics.diagnostics.get(sc.scene_id, {})
+                warning = diag.get("warning_type")
                 sc.warning = (
-                    "Aligned with only REVIEW confidence but has usable timestamps. "
-                    "Rendered anyway - please verify.")
+                    f"Aligned with only REVIEW confidence but has usable timestamps. "
+                    f"Rendered anyway - please verify."
+                    + (f" ({warning})" if warning else ""))
 
         refinements = self._stage(
             "Refining speech boundaries...", "Acoustic refinement",
@@ -242,6 +460,20 @@ class PipelineRunner:
             "scene_count": len(timeline.scenes),
             "stages": list(stages),
         }
+        if cache_meta:
+            metadata["transcription_cache"] = {
+                "source": cache_meta.get("source"),
+                "persistent_cache_key": cache_meta.get("persistent_cache_key"),
+                "cache_version": cache_meta.get("cache_version"),
+                "audio_sha256": cache_meta.get("audio_sha256"),
+            }
+        metadata["transcription_source"] = transcription_source
+        if recovery_regions:
+            metadata["recovery"] = {
+                "recovered_scene_ids": recovered_scene_ids,
+                "regions": recovery_regions,
+                "tail_recovery_triggered": tail_recovery_triggered,
+            }
         if alignment_warnings:
             metadata["alignment_warnings"] = alignment_warnings
         metadata["alignment_statuses"] = {
